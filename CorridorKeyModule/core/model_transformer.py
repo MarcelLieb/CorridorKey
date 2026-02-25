@@ -176,12 +176,8 @@ class GreenFormer(nn.Module):
         # Foreground Decoder (Outputs 3 channels)
         self.fg_decoder = DecoderHead(feature_channels, embedding_dim, output_dim=3)
 
-        # PointRend Module
-        # Fine Features: Input Image (4ch)
-        # Coarse Features: Coarse Prediction (4ch)
-        # Total In Features: 8
-        # --- Refiner (New) ---
-        # CNN Refiner instead of PointRend
+        # --- Refiner ---
+        # CNN Refiner
         # In Channels: 3 (RGB) + 4 (Coarse Pred) = 7
         self.use_refiner = use_refiner
         if self.use_refiner:
