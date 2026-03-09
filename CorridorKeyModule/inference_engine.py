@@ -298,6 +298,7 @@ class CorridorKeyEngine:
         despill_strength: float = 1.0,
         auto_despeckle: bool = True,
         despeckle_size: int = 400,
+        num_workers: int = torch.multiprocessing.cpu_count() // 2,
     ) -> list[dict[str, np.ndarray]]:
         """
         Process a single frame.
@@ -314,6 +315,7 @@ class CorridorKeyEngine:
             despill_strength: float. 0.0 to 1.0 multiplier for the despill effect.
             auto_despeckle: bool. If True, cleans up small disconnected components from the predicted alpha matte.
             despeckle_size: int. Minimum number of consecutive pixels required to keep an island.
+            num_workers: int. Number of worker threads used for post-processing
         Returns:
              list[dict: {'alpha': np, 'fg': np (sRGB), 'comp': np (sRGB on Gray)}]
         """
@@ -364,12 +366,17 @@ class CorridorKeyEngine:
         if handle:
             handle.remove()
 
-        out = []
-        for pred_alpha, pred_fg in zip(prediction["alpha"].cpu().float(), prediction["fg"].cpu().float()):
-            out.append(
-                self._postprocess_output(
-                    pred_alpha, pred_fg, w, h, fg_is_straight, despill_strength, auto_despeckle, despeckle_size
-                )
+        with torch.multiprocessing.Pool(num_workers) as pool:
+            input = zip(
+                prediction["alpha"].cpu().float(),
+                prediction["fg"].cpu().float(),
+                [w] * len(prediction["alpha"]),
+                [h] * len(prediction["alpha"]),
+                [fg_is_straight] * len(prediction["alpha"]),
+                [despill_strength] * len(prediction["alpha"]),
+                [auto_despeckle] * len(prediction["alpha"]),
+                [despeckle_size] * len(prediction["alpha"]),
             )
+            out = pool.starmap(self._postprocess_output, input)
 
         return out
