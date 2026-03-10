@@ -339,7 +339,7 @@ class CorridorKeyEngine:
         if mask_was_uint8:
             mask_linear = mask_linear / 255.0
 
-        h, w = image.shape[1:3]
+        bs, h, w = image.shape[:3]
 
         # Ensure Mask Shape
         if mask_linear.ndim == 3:
@@ -373,8 +373,8 @@ class CorridorKeyEngine:
         if handle:
             handle.remove()
 
-        with torch.multiprocessing.Pool(num_workers) as pool:
-            input = zip(
+        with torch.multiprocessing.Pool(min(num_workers, bs)) as pool:
+            inp = zip(
                 prediction["alpha"].cpu().float(),
                 prediction["fg"].cpu().float(),
                 [w] * len(prediction["alpha"]),
@@ -383,7 +383,8 @@ class CorridorKeyEngine:
                 [despill_strength] * len(prediction["alpha"]),
                 [auto_despeckle] * len(prediction["alpha"]),
                 [despeckle_size] * len(prediction["alpha"]),
+                strict=True,
             )
-            out = pool.starmap(self._postprocess_output, input)
+            out = pool.starmap(self._postprocess_output, inp)
 
         return out
