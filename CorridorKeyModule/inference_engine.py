@@ -3,14 +3,14 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
 
 import cv2
 import numpy as np
 import torch
-import torchvision
 import torch.nn.functional as F
+import torchvision
 import torchvision.transforms.functional as TF
-
 
 from .core import color_utils as cu
 from .core.model_transformer import GreenFormer
@@ -105,6 +105,10 @@ class CorridorKeyEngine:
             print(f"[Warning] Missing keys: {missing}")
         if len(unexpected) > 0:
             print(f"[Warning] Unexpected keys: {unexpected}")
+
+        # We only tested compilation on Windows and Linux. For other platforms compilation is disabled as a precaution.
+        if sys.platform == "linux" or sys.platform == "win32":
+            model = torch.compile(model)
 
         return model
 
