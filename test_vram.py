@@ -20,7 +20,6 @@ def test_vram():
         img_size=2048,
         device="cuda",
         model_precision=torch.float16,
-        mixed_precision=True,
     )
 
     # Reset stats
@@ -28,11 +27,11 @@ def test_vram():
 
     iterations = 24
     print(f"Running {iterations} inference passes...")
-    time = timeit.timeit(lambda: process_frame(engine), number=iterations, setup=lambda: process_frame(engine))
+    time = timeit.timeit(lambda: process_frame(engine), number=iterations)
     print(f"Seconds per frame: {time / iterations}")
 
     peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
-    print(f"Peak VRAM used: {peak_vram:.2f} GiB")
+    print(f"Peak VRAM used: {peak_vram:.2f} GB")
 
 
 if __name__ == "__main__":
