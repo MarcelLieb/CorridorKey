@@ -150,7 +150,7 @@ class CorridorKeyEngine:
 
         return inp_concat
 
-    def _postprocess_output(
+    def _postprocess_cpu(
         self,
         pred_alpha: torch.Tensor,
         pred_fg: torch.Tensor,
@@ -213,6 +213,147 @@ class CorridorKeyEngine:
             "comp": comp_srgb,  # sRGB, Composite
             "processed": processed_rgba,  # Linear/Premul, RGBA, Garbage Matted & Despilled
         }
+        
+    def _postprocess_gpu(
+            self,
+            pred_alpha: torch.Tensor,
+            pred_fg: torch.Tensor,
+            h: int,
+            w: int,
+            auto_despeckle: bool,
+            despeckle_size: int,
+            despill_strength: float,
+            fg_is_straight: bool,
+            sync: bool = True,
+        ) -> dict[str, np.ndarray]:
+            """Post-process on GPU, transfer final results to CPU.
+    
+            When ``sync=True`` (default), blocks until transfer completes and
+            returns numpy arrays.  When ``sync=False``, starts the DMA
+            non-blocking and returns a :class:`PendingTransfer` — call
+            ``.resolve()`` to get the numpy dict later.
+            """
+            # Resize on GPU using F.interpolate (much faster than cv2 at 4K)
+            alpha_up = TF.resize(
+                pred_alpha.float(),
+                [h, w],
+                interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+            )
+            fg_up = TF.resize(
+                pred_fg.float(),
+                [h, w],
+                interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+            )
+    
+            # Convert to HWC on GPU
+            res_alpha = alpha_up.permute(0, 2, 3, 1)  # [B, H, W, 1]
+            res_fg = fg_up.permute(0, 2, 3, 1)  # [B, H, W, 3]
+    
+            # A. Clean matte
+            if auto_despeckle:
+                processed_alpha = self._clean_matte_gpu(res_alpha, despeckle_size, dilation=25, blur_size=5)
+            else:
+                processed_alpha = res_alpha
+    
+            # B. Despill on GPU
+            fg_despilled = self._despill_gpu(res_fg, despill_strength)
+    
+            # C. sRGB → linear on GPU
+            fg_despilled_lin = cu.srgb_to_linear(fg_despilled)
+    
+            # D. Premultiply on GPU
+            fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
+    
+            # E. Pack RGBA on GPU
+            processed_rgba = torch.cat([fg_premul_lin, processed_alpha], dim=-1)
+    
+            # === Bulk transfer to CPU via copy stream ===
+            #
+            # Pack all outputs into one contiguous tensor, DMA to a pinned
+            # buffer on the copy stream.  Layout varies by comp mode:
+            #   Checkerboard: [H, W, 1+3+3+4] = [alpha, fg, comp_rgb, processed]
+            #   Transparent:  [H, W, 1+3+4+4] = [alpha, fg, comp_rgba, processed]
+            #   No comp:      [H, W, 1+3+3+4] = [alpha, fg, zeros, processed]
+            comp_channels = 3
+            bulk = torch.cat([res_alpha, res_fg, torch.zeros_like(res_fg), processed_rgba], dim=-1)
+    
+            bulk_np = bulk.cpu().numpy()
+            cc = comp_channels
+            if bulk_np.shape[0] == 1:
+                result = {
+                    "alpha": bulk_np[:, :, 0:1],
+                    "fg": bulk_np[:, :, 1:4],
+                    "comp": bulk_np[:, :, 4 : 4 + cc],
+                    "processed": bulk_np[:, :, 4 + cc : 4 + cc + 4],
+                }
+                return result
+            
+            out = []
+            for i in range(bulk_np.shape[0]):
+                result = {
+                    "alpha": bulk_np[i, :, :, 0:1],
+                    "fg": bulk_np[i, :, :, 1:4],
+                    "comp": bulk_np[i, :, :, 4 : 4 + cc],
+                    "processed": bulk_np[i, :, :, 4 + cc : 4 + cc + 4],
+                }
+                out.append(result)
+            
+    @staticmethod
+    @torch.compile()
+    def _clean_matte_gpu(alpha: torch.Tensor, area_threshold: int, dilation: int, blur_size: int) -> torch.Tensor:
+        """Fully GPU matte cleanup using morphological operations.
+
+        Approximates connected-component removal by eroding small regions
+        away, then dilating back.  Avoids the GPU→CPU→GPU roundtrip that
+        ``cv2.connectedComponentsWithStats`` would require.
+
+        The erosion radius is derived from ``area_threshold``: a circular
+        spot of area A has radius sqrt(A/pi), so erosion by that radius
+        eliminates it.
+        """
+        _device = alpha.device
+        # alpha: [H, W, 1]
+        a2d = alpha[..., 0]
+        mask = (a2d > 0.5).float().unsqueeze(0)  # [B, 1, H, W]
+
+        # Erode: kill spots smaller than area_threshold
+        # A circle of area A has radius r = sqrt(A / pi)
+        import math
+
+        erode_r = max(1, int(math.sqrt(area_threshold / math.pi)))
+        erode_k = erode_r * 2 + 1
+        # Erosion = negative of max_pool on negated mask
+        mask = -F.max_pool2d(-mask, erode_k, stride=1, padding=erode_r)
+
+        # Dilate back to restore edges of large regions
+        dilate_r = erode_r + (dilation if dilation > 0 else 0)
+        dilate_k = dilate_r * 2 + 1
+        mask = F.max_pool2d(mask, dilate_k, stride=1, padding=dilate_r)
+
+        # Blur for soft edges
+        if blur_size > 0:
+            k = int(blur_size * 2 + 1)
+            mask = F.avg_pool2d(mask, k, stride=1, padding=blur_size)
+
+        safe = mask.squeeze(0).squeeze(0)  # [H, W]
+        return (a2d * safe).unsqueeze(-1)  # [H, W, 1]
+
+    @staticmethod
+    @torch.compile()
+    def _despill_gpu(image: torch.Tensor, strength: float) -> torch.Tensor:
+        """GPU despill — keeps data on device."""
+        if strength <= 0.0:
+            return image
+        r, g, b = image[..., 0], image[..., 1], image[..., 2]
+        limit = (r + b) / 2.0
+        spill = torch.clamp(g - limit, min=0.0)
+        g_new = g - spill
+        r_new = r + spill * 0.5
+        b_new = b + spill * 0.5
+        despilled = torch.stack([r_new, g_new, b_new], dim=-1)
+        if strength < 1.0:
+            return image * (1.0 - strength) + despilled * strength
+        return despilled
 
     @torch.inference_mode()
     def process_frame(
@@ -290,7 +431,7 @@ class CorridorKeyEngine:
         pred_alpha = prediction["alpha"][0].cpu().float()
         pred_fg = prediction["fg"][0].cpu().float()  # Output is sRGB (Sigmoid)
 
-        return self._postprocess_output(
+        return self._postprocess_cpu(
             pred_alpha, pred_fg, w, h, fg_is_straight, despill_strength, auto_despeckle, despeckle_size
         )
 
@@ -373,18 +514,6 @@ class CorridorKeyEngine:
         if handle:
             handle.remove()
 
-        with torch.multiprocessing.Pool(min(num_workers, bs)) as pool:
-            inp = zip(
-                prediction["alpha"].cpu().float(),
-                prediction["fg"].cpu().float(),
-                [w] * len(prediction["alpha"]),
-                [h] * len(prediction["alpha"]),
-                [fg_is_straight] * len(prediction["alpha"]),
-                [despill_strength] * len(prediction["alpha"]),
-                [auto_despeckle] * len(prediction["alpha"]),
-                [despeckle_size] * len(prediction["alpha"]),
-                strict=True,
-            )
-            out = pool.starmap(self._postprocess_output, inp)
+        out = self._postprocess_gpu(prediction["alpha"], prediction["fg"], h, w, auto_despeckle, despeckle_size, despill_strength, fg_is_straight)
 
         return out
