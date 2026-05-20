@@ -153,9 +153,26 @@ def _prompt_inference_settings(
     default_refiner: float | None = None,
     default_comp: bool | None = None,
     default_gpu_post: bool | None = None,
+    default_image_size: int | None = None,
+    default_tiled_inference: bool | None = None,
+    default_screen_color: str | None = None,
 ) -> InferenceSettings:
     """Interactively prompt for inference settings, skipping any pre-filled values."""
     console.print(Panel("Inference Settings", style="bold cyan"))
+    generate_comp = default_comp if default_comp is not None else InferenceSettings.generate_comp
+    gpu_post_processing = default_gpu_post if default_gpu_post is not None else InferenceSettings.gpu_post_processing
+    tiled_inference = (
+        default_tiled_inference if default_tiled_inference is not None else InferenceSettings.tiled_inference
+    )
+
+    if default_screen_color is not None:
+        screen_color = default_screen_color
+    else:
+        screen_color = Prompt.ask(
+            "Screen color",
+            choices=["auto", "green", "blue"],
+            default="auto",
+        )
 
     if default_linear is not None:
         input_is_linear = default_linear
@@ -193,6 +210,15 @@ def _prompt_inference_settings(
         )
         despeckle_size = max(0, despeckle_size)
 
+    if default_image_size is not None:
+        image_size = default_image_size
+    else:
+        image_size = Prompt.ask("Inference image size", choices=["512", "1024", "2048"], default="2048")
+        try:
+            image_size = int(image_size)
+        except ValueError:
+            image_size = 2048
+
     if default_refiner is not None:
         refiner_scale = default_refiner
     else:
@@ -205,7 +231,18 @@ def _prompt_inference_settings(
         except ValueError:
             refiner_scale = 1.0
 
-    if resolve_backend() == "torch":
+    backend = resolve_backend()
+
+    if backend == "mlx":
+        if default_tiled_inference is not None:
+            tiled_inference = default_tiled_inference
+        else:
+            tiled_inference = Confirm.ask(
+                "Use mlx tiled inference",
+                default=False,
+            )
+
+    if backend == "torch":
         if default_comp is not None:
             generate_comp = default_comp
         else:
@@ -233,6 +270,9 @@ def _prompt_inference_settings(
         refiner_scale=refiner_scale,
         generate_comp=generate_comp,
         gpu_post_processing=gpu_post_processing,
+        image_size=image_size,
+        tiled_inference=tiled_inference,
+        screen_color=screen_color,
     )
 
 
@@ -307,6 +347,10 @@ def run_inference_cmd(
         Optional[int],
         typer.Option("--despeckle-size", help="Min pixel size for despeckle (default: prompt)"),
     ] = None,
+    image_size: Annotated[
+        Optional[int],
+        typer.Option("--image-size", help="Inference image size"),
+    ] = None,
     refiner: Annotated[
         Optional[float],
         typer.Option("--refiner", help="Refiner strength multiplier (default: prompt)"),
@@ -319,12 +363,26 @@ def run_inference_cmd(
         Optional[bool],
         typer.Option("--gpu-post/--cpu-post", help="Use GPU post-processing (default: prompt)"),
     ] = None,
+    tiled_inference: Annotated[
+        Optional[bool],
+        typer.Option("--tile/--no-tile", help="Use mlx tiled inference (default: prompt)"),
+    ] = None,
+    screen_color: Annotated[
+        Optional[str],
+        typer.Option(
+            "--screen-color",
+            help="Screen color: auto (detect), green, or blue (default: prompt)",
+        ),
+    ] = None,
 ) -> None:
     """Run CorridorKey inference on clips with Input + AlphaHint.
 
     Settings can be passed as flags for non-interactive use, or omitted to
     prompt interactively.
     """
+    if screen_color is not None and screen_color not in ("auto", "green", "blue"):
+        raise typer.BadParameter(f"--screen-color must be one of: auto, green, blue (got '{screen_color}')")
+
     clips = scan_clips()
 
     # despeckle_size excluded — sensible default even in headless mode
@@ -338,6 +396,11 @@ def run_inference_cmd(
             auto_despeckle=despeckle,
             despeckle_size=despeckle_size if despeckle_size is not None else 400,
             refiner_scale=refiner,
+            generate_comp=generate_comp,
+            gpu_post_processing=gpu_post,
+            image_size=image_size,
+            tiled_inference=tiled_inference,
+            screen_color=screen_color if screen_color is not None else "auto",
         )
     else:
         settings = _prompt_inference_settings(
@@ -348,6 +411,9 @@ def run_inference_cmd(
             default_refiner=refiner,
             default_comp=generate_comp,
             default_gpu_post=gpu_post,
+            default_image_size=image_size,
+            default_tiled_inference=tiled_inference,
+            default_screen_color=screen_color,
         )
 
     with ProgressContext() as ctx_progress:
@@ -384,6 +450,12 @@ def interactive_wizard(win_path: str, device: str | None = None) -> None:
 
     # 1. Resolve Path
     console.print(f"Windows Path: {win_path}")
+
+    # Perform a check, if we expect user to provide us directory,
+    # but accidentially gave us the path to the footage instead,
+    # we should presume the parent folder as substitution instead.
+    if os.path.isfile(win_path):
+        win_path = os.path.abspath(os.path.join(win_path, os.pardir))
 
     if os.path.exists(win_path):
         process_path = win_path

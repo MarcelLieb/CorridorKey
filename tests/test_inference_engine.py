@@ -278,6 +278,79 @@ class TestProcessFramePostProcessing:
 
     @pytest.mark.parametrize("backend", ["openCV", "torch"])
     @pytest.mark.parametrize("batched", [True, False])
+    def test_despill_blue_screen_channel(self, sample_frame_rgb, sample_mask, backend, batched):
+        """screen_channel=2 must despill the blue channel; default screen_channel=1 must leave a
+        blue-heavy plate untouched (the green-channel despill never triggers when G is below the
+        R/B average).
+
+        Without channel routing, a blue-screen plate would never get its spill removed because
+        the green-default math only looks at G excess. This test guards against that regression:
+        if someone reverts the channel parameter, blue plates would silently skip despill and
+        the cast would survive into the comp.
+        """
+        from unittest.mock import MagicMock
+
+        def blue_heavy_forward(x):
+            b, c, h, w = x.shape
+            fg = torch.zeros(b, 3, h, w, dtype=torch.float32)
+            fg[:, 0, :, :] = 0.2  # R
+            fg[:, 1, :, :] = 0.2  # G
+            fg[:, 2, :, :] = 0.8  # B — heavy blue spill: B >> (R+G)/2
+            return {
+                "alpha": torch.full((b, 1, h, w), 0.8, dtype=torch.float32),
+                "fg": fg,
+            }
+
+        blue_mock = MagicMock()
+        blue_mock.side_effect = blue_heavy_forward
+        blue_mock.refiner = None
+        blue_mock.use_refiner = False
+
+        engine = _make_engine_with_mock(blue_mock)
+
+        if batched:
+            sample_frame_rgb = np.stack([sample_frame_rgb] * 2, axis=0)
+            sample_mask = np.stack([sample_mask] * 2, axis=0)
+            result_green_default = engine.process_frame(
+                sample_frame_rgb,
+                sample_mask,
+                despill_strength=1.0,
+                post_process_on_gpu=backend == "torch",
+            )[0]
+            result_blue = engine.process_frame(
+                sample_frame_rgb,
+                sample_mask,
+                despill_strength=1.0,
+                screen_channel=2,
+                post_process_on_gpu=backend == "torch",
+            )[0]
+        else:
+            result_green_default = engine.process_frame(
+                sample_frame_rgb,
+                sample_mask,
+                despill_strength=1.0,
+                post_process_on_gpu=backend == "torch",
+            )
+            result_blue = engine.process_frame(
+                sample_frame_rgb,
+                sample_mask,
+                despill_strength=1.0,
+                screen_channel=2,
+                post_process_on_gpu=backend == "torch",
+            )
+
+        rgb_green_default = result_green_default["processed"][:, :, :3]
+        rgb_blue = result_blue["processed"][:, :, :3]
+
+        # Default (green) path: blue channel is untouched because G is below (R+B)/2.
+        # Blue path: blue channel is reduced because B >> (R+G)/2.
+        assert rgb_blue[:, :, 2].mean() < rgb_green_default[:, :, 2].mean(), (
+            "screen_channel=2 should reduce the blue channel, while screen_channel=1 (default) "
+            "leaves a blue-heavy plate untouched"
+        )
+
+    @pytest.mark.parametrize("backend", ["openCV", "torch"])
+    @pytest.mark.parametrize("batched", [True, False])
     def test_auto_despeckle_toggle(self, sample_frame_rgb, sample_mask, mock_greenformer, backend, batched):
         """auto_despeckle=False should skip clean_matte without crashing."""
         engine = _make_engine_with_mock(mock_greenformer)
@@ -403,3 +476,91 @@ class TestNvidiaGPUProcess:
         assert result["alpha"].dtype == np.float32
         assert len(captured_device) == 1, "Model should be called exactly once"
         assert captured_device[0].type == "cuda", f"Expected model input on cuda, got {captured_device[0]}"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint format dispatch (.safetensors vs .pth)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadModelFormatDispatch:
+    """Verify _load_model routes to the right loader based on file extension.
+
+    The engine must support both .safetensors (preferred) and .pth (legacy).
+    These tests exercise the branch in _load_model without needing the real
+    GreenFormer or full model weights — we patch GreenFormer and feed it a
+    tiny random state dict in each format.
+    """
+
+    def _make_random_state_dict(self) -> dict[str, torch.Tensor]:
+        """A handful of leaf tensors that load_state_dict(strict=False) ignores cleanly."""
+        return {
+            "dummy.weight": torch.zeros(4, 4),
+            "dummy.bias": torch.zeros(4),
+        }
+
+    def _patch_greenformer(self, monkeypatch):
+        """Replace GreenFormer with a stub exposing the state-dict API _load_model needs."""
+        from unittest.mock import MagicMock
+
+        import CorridorKeyModule.inference_engine as engine_mod
+
+        stub = MagicMock()
+        stub.state_dict.return_value = self._make_random_state_dict()
+        stub.to.return_value = stub
+        stub.eval.return_value = stub
+        stub.load_state_dict.return_value = ([], [])
+
+        factory = MagicMock(return_value=stub)
+        monkeypatch.setattr(engine_mod, "GreenFormer", factory)
+        return stub
+
+    def test_safetensors_checkpoint_loads_via_safetensors_library(self, tmp_path, monkeypatch):
+        """A .safetensors path must be dispatched to safetensors.torch.load_file."""
+        from unittest import mock
+
+        from safetensors.torch import save_file
+
+        from CorridorKeyModule.inference_engine import CorridorKeyEngine
+
+        ckpt = tmp_path / "model.safetensors"
+        save_file(self._make_random_state_dict(), str(ckpt))
+
+        self._patch_greenformer(monkeypatch)
+        # torch.load must NOT be called when the checkpoint is safetensors.
+        with mock.patch("torch.load", side_effect=AssertionError("torch.load called for .safetensors")):
+            engine = object.__new__(CorridorKeyEngine)
+            engine.device = torch.device("cpu")
+            engine.img_size = 64
+            engine.checkpoint_path = str(ckpt)
+            engine.use_refiner = False
+            engine.model_precision = torch.float32
+            engine._is_rocm = False
+
+            model = engine._load_model()
+            assert model is not None
+
+    def test_pth_checkpoint_loads_via_torch_load(self, tmp_path, monkeypatch):
+        """A .pth path must be dispatched to torch.load (legacy path)."""
+        from unittest import mock
+
+        from CorridorKeyModule.inference_engine import CorridorKeyEngine
+
+        ckpt = tmp_path / "model.pth"
+        torch.save(self._make_random_state_dict(), str(ckpt))
+
+        self._patch_greenformer(monkeypatch)
+        with mock.patch(
+            "safetensors.torch.load_file",
+            side_effect=AssertionError("safetensors.load_file called for .pth"),
+        ):
+            engine = object.__new__(CorridorKeyEngine)
+            engine.device = torch.device("cpu")
+            engine.img_size = 64
+            engine.checkpoint_path = str(ckpt)
+            engine.use_refiner = False
+            engine.model_precision = torch.float32
+            engine._is_rocm = False
+
+            model = engine._load_model()
+            assert model is not None

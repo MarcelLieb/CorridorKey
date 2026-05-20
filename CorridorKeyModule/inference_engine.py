@@ -24,6 +24,31 @@ os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _inductor_cache)
 logger = logging.getLogger(__name__)
 
 
+def _try_activate_msvc() -> None:
+    """Find and activate MSVC (cl.exe) on Windows if installed but not in PATH.
+
+    Searches common Visual Studio install locations for the latest cl.exe
+    and adds its directory to PATH.
+    """
+    import glob
+
+    patterns = [
+        r"C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe",
+        r"C:\Program Files\Microsoft Visual Studio\2019\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe",
+    ]
+
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern), reverse=True)  # newest version first
+        if matches:
+            cl_dir = os.path.dirname(matches[0])
+            os.environ["PATH"] = cl_dir + os.pathsep + os.environ.get("PATH", "")
+            logger.info("Auto-detected MSVC: %s", matches[0])
+            return
+
+    logger.debug("MSVC not found in standard locations")
+
+
 class CorridorKeyEngine:
     def __init__(
         self,
@@ -58,12 +83,29 @@ class CorridorKeyEngine:
         self._is_rocm = hasattr(torch.version, "hip") and torch.version.hip
         self.model = self._load_model()
 
-        # torch.compile is tested on CUDA (Windows + Linux) and ROCm (Linux).
-        # ROCm on Windows hangs during Triton kernel compilation — skip it.
-        # CORRIDORKEY_SKIP_COMPILE=1 forces eager mode (useful for testing).
-        skip_compile = (self._is_rocm and sys.platform == "win32") or os.environ.get("CORRIDORKEY_SKIP_COMPILE") == "1"
-        if skip_compile:
-            logger.info("Skipping torch.compile (eager mode)")
+        # torch.compile needs: cl.exe (Windows), gcc (Linux), and Triton.
+        # Check prerequisites and skip with a helpful message if missing.
+        import shutil
+
+        # Auto-detect MSVC on Windows — it's installed but not in PATH by default
+        if sys.platform == "win32" and not shutil.which("cl"):
+            _try_activate_msvc()
+
+        skip_reason = None
+        if self._is_rocm and sys.platform == "win32":
+            skip_reason = "ROCm on Windows — Triton compilation hangs"
+        elif os.environ.get("CORRIDORKEY_SKIP_COMPILE") == "1":
+            skip_reason = "CORRIDORKEY_SKIP_COMPILE=1"
+        elif sys.platform == "win32" and not shutil.which("cl"):
+            skip_reason = (
+                "MSVC (cl.exe) not found. Install Visual Studio Build Tools "
+                "for ~30% faster inference: https://visualstudio.microsoft.com/visual-cpp-build-tools/"
+            )
+        elif sys.platform == "linux" and not shutil.which("gcc") and not shutil.which("cc"):
+            skip_reason = "no C compiler found — install gcc for faster inference"
+
+        if skip_reason:
+            logger.info("Skipping torch.compile (%s)", skip_reason)
         elif sys.platform == "linux" or sys.platform == "win32":
             self._compile()
 
@@ -80,8 +122,14 @@ class CorridorKeyEngine:
         if not os.path.isfile(self.checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
 
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=True)
-        state_dict = checkpoint.get("state_dict", checkpoint)
+        if self.checkpoint_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            state_dict = load_file(self.checkpoint_path, device=str(self.device))
+        else:
+            # DEPRECATED: remove after .pth sunset
+            checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=True)
+            state_dict = checkpoint.get("state_dict", checkpoint)
 
         # Fix Compiled Model Prefix & Handle PosEmbed Mismatch
         new_state_dict = {}
@@ -159,7 +207,7 @@ class CorridorKeyEngine:
             self.model = compiled_model
             logger.info("Model compiled successfully (mode=%s)", compile_mode)
 
-        except Exception as e:
+        except (RuntimeError, OSError) as e:
             logger.info(f"Compilation error: {e}")
             logger.warning("Model compilation failed. Falling back to eager mode.")
             if torch.cuda.is_available():
@@ -205,6 +253,7 @@ class CorridorKeyEngine:
         auto_despeckle: bool,
         despeckle_size: int,
         generate_comp: bool,
+        screen_channel: int = 1,
     ) -> dict[str, np.ndarray]:
         # 6. Post-Process (Resize Back to Original Resolution)
         # We use Lanczos4 for high-quality resampling to minimize blur when going back to 4K/Original.
@@ -226,7 +275,9 @@ class CorridorKeyEngine:
 
         # B. Despill FG
         # res_fg is sRGB.
-        fg_despilled = cu.despill_opencv(res_fg, green_limit_mode="average", strength=despill_strength)
+        fg_despilled = cu.despill_opencv(
+            res_fg, limit_mode="average", strength=despill_strength, screen_channel=screen_channel
+        )
 
         # C. Premultiply (for EXR Output)
         # CONVERT TO LINEAR FIRST! EXRs must house linear color premultiplied by linear alpha.
@@ -273,6 +324,7 @@ class CorridorKeyEngine:
         auto_despeckle: bool,
         despeckle_size: int,
         generate_comp: bool,
+        screen_channel: int = 1,
     ) -> list[dict[str, np.ndarray]]:
         """Post-process on GPU, transfer final results to CPU.
 
@@ -294,7 +346,6 @@ class CorridorKeyEngine:
         )
 
         del pred_fg, pred_alpha
-        torch.cuda.empty_cache()
 
         # A. Clean matte
         if auto_despeckle:
@@ -303,7 +354,7 @@ class CorridorKeyEngine:
             processed_alpha = alpha
 
         # B. Despill on GPU
-        processed_fg = cu.despill_torch(fg, despill_strength)
+        processed_fg = cu.despill_torch(fg, despill_strength, screen_channel=screen_channel)
 
         # C. sRGB → linear on GPU
         processed_fg_lin = cu.srgb_to_linear(processed_fg)
@@ -357,6 +408,7 @@ class CorridorKeyEngine:
         despeckle_size: int = 400,
         generate_comp: bool = True,
         post_process_on_gpu: bool = True,
+        screen_channel: int = 1,
     ) -> dict[str, np.ndarray] | list[dict[str, np.ndarray]]:
         """
         Process a single frame.
@@ -375,6 +427,9 @@ class CorridorKeyEngine:
             despeckle_size: int. Minimum number of consecutive pixels required to keep an island.
             generate_comp: bool. If True, also generates a composite on checkerboard for quick checking.
             post_process_on_gpu: bool. If True, performs post-processing on GPU using PyTorch instead of OpenCV.
+            screen_channel: int. RGB index of the screen color to despill against. 1=green (default,
+                            backwards-compatible), 2=blue. Routed through to despill_opencv/despill_torch
+                            so the same despill math operates on the correct channel for the loaded model.
         Returns:
              dict: {'alpha': np, 'fg': np (sRGB), 'comp': np (sRGB on Gray)}
         """
@@ -434,6 +489,7 @@ class CorridorKeyEngine:
                 auto_despeckle,
                 despeckle_size,
                 generate_comp,
+                screen_channel=screen_channel,
             )
         else:
             # Move prediction to CPU before post-processing
@@ -452,6 +508,7 @@ class CorridorKeyEngine:
                     auto_despeckle,
                     despeckle_size,
                     generate_comp,
+                    screen_channel=screen_channel,
                 )
                 out.append(result)
 
